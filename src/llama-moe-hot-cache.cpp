@@ -242,6 +242,7 @@ static std::vector<llama_moe_hot_cache_entry> score_observations_for_arch(
     switch (arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GLM4_MOE:
         default: {
             const auto config = weighting_config_from_params(params);
             return llama_moe_hot_cache_weighting::score_observations(observations, config);

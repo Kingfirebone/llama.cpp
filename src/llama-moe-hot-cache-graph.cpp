@@ -598,7 +598,11 @@ static ggml_tensor * llama_moe_hot_cache_build_moe_hot_from_logits(
              ggml_tensor * cur,
              ggml_tensor * logits,
                  int   il,
-     llm_ffn_op_type   type_op) {
+     llm_ffn_op_type   type_op,
+     llama_expert_gating_func_type gating_op,
+             ggml_tensor * exp_probs_b,
+                    bool   norm_w,
+                   float   w_scale) {
     ggml_context * ctx0 = graph.ctx0;
     ggml_cgraph * gf = graph.gf;
     ggml_backend_sched_t sched = graph.sched;
@@ -622,7 +626,14 @@ static ggml_tensor * llama_moe_hot_cache_build_moe_hot_from_logits(
 
     ggml_tensor * worklist_shape = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, capacity, LLAMA_MOE_HOT_CACHE_WORKLIST_FIELD_COUNT);
     ggml_tensor * worklist = nullptr;
-    if (!cparams.warmup && n_tokens == 1 && profile.cpu_decode_routing) {
+    // The softmax fast paths below renormalize over the top-k selected logits. That is
+    // numerically equivalent to build_moe_ffn only for plain softmax gating with no
+    // selection bias (the full-softmax denominator cancels under top-k renormalization).
+    // Sigmoid / biased / explicitly-normalized gating (e.g. GLM4_MOE) must take the
+    // general path so the hot lane reproduces build_moe_ffn exactly.
+    const bool softmax_fast_path =
+        gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && exp_probs_b == nullptr;
+    if (softmax_fast_path && !cparams.warmup && n_tokens == 1 && profile.cpu_decode_routing) {
         worklist = ggml_map_custom2(
                 ctx0,
                 worklist_shape,
@@ -630,7 +641,7 @@ static ggml_tensor * llama_moe_hot_cache_build_moe_hot_from_logits(
                 llama_qwen35moe_hot_cache_build_worklist_from_logits_op,
                 1,
                 const_cast<llama_moe_hot_cache_layer *>(&cache));
-    } else {
+    } else if (softmax_fast_path) {
         ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, logits, n_moe_slots);
         graph.cb(selected_experts->src[0], "ffn_moe_argsort", il);
         graph.cb(selected_experts, "ffn_moe_topk", il);
@@ -647,6 +658,62 @@ static ggml_tensor * llama_moe_hot_cache_build_moe_hot_from_logits(
 
         if (hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f) {
             weights = ggml_scale(ctx0, weights, hparams.expert_weights_scale);
+            graph.cb(weights, "ffn_moe_weights_scaled", il);
+        }
+
+        worklist = ggml_map_custom3(
+                ctx0,
+                worklist_shape,
+                selected_experts,
+                weights,
+                llama_qwen35moe_hot_cache_build_worklist_op,
+                1,
+                const_cast<llama_moe_hot_cache_layer *>(&cache));
+    } else {
+        // General gating path, mirroring llm_graph_context::build_moe_ffn.
+        ggml_tensor * probs = nullptr;
+        switch (gating_op) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+                probs = ggml_soft_max(ctx0, logits);
+                break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+                probs = ggml_sigmoid(ctx0, logits);
+                break;
+            default:
+                GGML_ABORT("unsupported MoE hot-cache gating function");
+        }
+        graph.cb(probs, "ffn_moe_probs", il);
+
+        // selection bias (DeepSeek-V3 style) affects expert selection only
+        ggml_tensor * selection_probs = probs;
+        if (exp_probs_b != nullptr) {
+            selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+            graph.cb(selection_probs, "ffn_moe_probs_biased", il);
+        }
+
+        ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_moe_slots);
+        graph.cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        graph.cb(selected_experts, "ffn_moe_topk", il);
+
+        // gather the unbiased probs for the selected experts
+        ggml_tensor * probs_rows = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+        ggml_tensor * weights = ggml_get_rows(ctx0, probs_rows, selected_experts);
+        graph.cb(weights, "ffn_moe_weights", il);
+
+        if (norm_w) {
+            weights = ggml_reshape_2d(ctx0, weights, n_moe_slots, n_tokens);
+
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+            // clamp to the smallest F16-representable value to avoid division by zero
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+            weights = ggml_div(ctx0, weights, weights_sum);
+            graph.cb(weights, "ffn_moe_weights_norm", il);
+        }
+
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_moe_slots, n_tokens);
+
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+            weights = ggml_scale(ctx0, weights, w_scale);
             graph.cb(weights, "ffn_moe_weights_scaled", il);
         }
 
@@ -1495,5 +1562,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn_hot(ggml_tensor * cu
 }
 
 ggml_tensor * llama_model_gemma4::graph::build_layer_moe_hot(ggml_tensor * cur, ggml_tensor * logits, const int il) {
-    return llama_moe_hot_cache_build_moe_hot_from_logits(*this, model, cur, logits, il, LLM_FFN_GELU);
+    return llama_moe_hot_cache_build_moe_hot_from_logits(
+            *this, model, cur, logits, il, LLM_FFN_GELU,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+            /* exp_probs_b = */ nullptr,
+            /* norm_w      = */ true,
+            /* w_scale     = */ 1.0f);
+}
+
+ggml_tensor * llama_model_glm4_moe::graph::build_layer_moe_hot(ggml_tensor * cur, ggml_tensor * logits, const int il) {
+    return llama_moe_hot_cache_build_moe_hot_from_logits(
+            *this, model, cur, logits, il, LLM_FFN_SILU,
+            (llama_expert_gating_func_type) hparams.expert_gating_func,
+            model.layers[il].ffn_exp_probs_b,
+            hparams.expert_weights_norm,
+            hparams.expert_weights_scale);
 }

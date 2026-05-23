@@ -160,3 +160,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# generated MoE hot-cache profiles (model/quant specific)
+moe-hot-*-cache.json
