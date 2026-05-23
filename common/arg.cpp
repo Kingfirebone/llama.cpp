@@ -2403,6 +2403,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HOT_CACHE_MAX_MIB"));
     add_opt(common_arg(
+        {"--moe-hot-cache-ram-mib"}, "N",
+        "experimental: MiB of host RAM used to pin (mlock) the warmest non-VRAM MoE experts so they are not re-read from disk (0 = disabled). Requires --moe-hot-cache",
+        [](common_params & params, const std::string & value_str) {
+            const int64_t value = std::stoll(value_str);
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_hot_cache_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_CACHE_RAM_MIB"));
+    add_opt(common_arg(
         {"--moe-hot-cache-auto-reserve-mib"}, "N",
         string_format("experimental: MiB to keep free when --moe-hot-cache-max-mib -1 auto-sizes the hot cache (default: %zu)", (size_t) params.moe_hot_cache_auto_reserve_mib),
         [](common_params & params, const std::string & value_str) {

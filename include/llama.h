@@ -306,6 +306,8 @@ extern "C" {
 
         // Experimental Qwen3.5 MoE hot expert cache. 0 disables it, -1 uses remaining VRAM after model load and context reservation.
         int64_t moe_hot_cache_max_mib;
+        // MiB of host RAM used to pin (mlock) the warmest non-VRAM MoE experts so the OS does not evict them to disk. 0 disables it.
+        int64_t moe_hot_cache_ram_mib;
         const char * moe_hot_cache_path;
         uint32_t moe_hot_cache_auto_n_ctx;
         uint32_t moe_hot_cache_auto_n_seq_max;

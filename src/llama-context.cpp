@@ -315,6 +315,10 @@ llama_context::llama_context(
 
     llama_moe_hot_cache_init_after_context_memory(model);
 
+    // Pin the warmest non-VRAM experts into host RAM. Done here (after both the eager and the
+    // auto-budget VRAM hot-cache builds) so the RAM tier can skip experts already in VRAM.
+    llama_moe_hot_cache_pin_ram(const_cast<llama_model &>(model), model.get_params());
+
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);

@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,14 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 namespace {
 
@@ -45,6 +54,40 @@ static size_t tensor_expert_bytes(const ggml_tensor * t) {
         throw std::runtime_error("MoE expert tensor has invalid expert dimension");
     }
     return ggml_nbytes(t) / size_t(t->ne[2]);
+}
+
+static size_t host_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return size_t(si.dwPageSize) > 0 ? size_t(si.dwPageSize) : 4096;
+#else
+    const long ps = sysconf(_SC_PAGESIZE);
+    return ps > 0 ? size_t(ps) : 4096;
+#endif
+}
+
+// Pin a host byte-range into RAM (page-aligned by the caller). Returns 0 on success or the
+// errno-style failure code (ENOMEM/EPERM most commonly when RLIMIT_MEMLOCK is too low).
+static int pin_host_range(void * addr, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+#if defined(_WIN32)
+    if (VirtualLock(addr, len)) {
+        return 0;
+    }
+    return int(GetLastError());
+#elif defined(_POSIX_MEMLOCK_RANGE) || defined(__linux__) || defined(__APPLE__)
+    if (mlock(addr, len) == 0) {
+        return 0;
+    }
+    return errno != 0 ? errno : -1;
+#else
+    (void) addr;
+    (void) len;
+    return ENOTSUP;
+#endif
 }
 
 static void add_saturating(uint64_t & dst, uint64_t value) {
@@ -765,6 +808,143 @@ void llama_moe_hot_cache_init(llama_model & model, const llama_model_params & pa
     cache->bufs.emplace_back(std::move(buf));
     cache->ctxs.emplace_back(std::move(ctx));
     model.moe_hot_cache = std::move(cache);
+}
+
+void llama_moe_hot_cache_pin_ram(llama_model & model, const llama_model_params & params) {
+    if (params.moe_hot_cache_ram_mib <= 0) {
+        return;
+    }
+    if (model.hparams.vocab_only) {
+        return;
+    }
+    if (params.moe_hot_cache_path == nullptr || params.moe_hot_cache_path[0] == '\0') {
+        LLAMA_LOG_WARN("%s: --moe-hot-cache-ram-mib set but --moe-hot-cache (perf JSON) is missing; skipping RAM pin\n", __func__);
+        return;
+    }
+
+    std::ifstream file(params.moe_hot_cache_path);
+    if (!file) {
+        LLAMA_LOG_WARN("%s: failed to open --moe-hot-cache file: %s; skipping RAM pin\n", __func__, params.moe_hot_cache_path);
+        return;
+    }
+    const std::string json_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+    std::vector<llama_moe_hot_cache_entry> observed;
+    try {
+        const auto observations = llama_moe_hot_cache_parse_perf_json_observations(json_str);
+        observed = score_observations_for_arch(model.arch, observations, &params);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: failed to parse --moe-hot-cache file (%s); skipping RAM pin\n", __func__, e.what());
+        return;
+    }
+    if (observed.empty()) {
+        LLAMA_LOG_WARN("%s: no experts in perf JSON; skipping RAM pin\n", __func__);
+        return;
+    }
+
+    const auto sizes = collect_expert_sizes(model);
+    std::unordered_map<uint64_t, size_t> size_by_expert;
+    size_by_expert.reserve(sizes.size());
+    for (const auto & s : sizes) {
+        size_by_expert[key(s.layer, s.expert)] = s.bytes;
+    }
+
+    const size_t budget_bytes = size_t(params.moe_hot_cache_ram_mib) * LLAMA_MOE_HOT_CACHE_MIB;
+    const size_t page = host_page_size();
+
+    size_t pinned_bytes  = 0; // logical expert bytes counted against the budget
+    size_t locked_bytes  = 0; // actual page-aligned bytes locked
+    size_t pinned_experts = 0;
+    size_t skipped_vram  = 0;
+    bool   limit_hit     = false;
+    int    limit_errno   = 0;
+
+    // Pin one page-aligned expert slice of a host-resident expert tensor.
+    // Returns false only when the OS refused the lock (limit reached).
+    const auto pin_tensor_expert = [&](ggml_tensor * t, uint32_t expert) -> bool {
+        if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
+            return true;
+        }
+        if (!ggml_backend_buffer_is_host(t->buffer)) {
+            return true; // expert lives on a non-host (e.g. GPU) buffer; nothing to pin
+        }
+        if (uint32_t(t->ne[2]) <= expert) {
+            return true;
+        }
+        const size_t    ebytes = tensor_expert_bytes(t);
+        const uintptr_t start  = uintptr_t(t->data) + size_t(t->nb[2]) * expert;
+        const uintptr_t end    = start + ebytes;
+        const uintptr_t astart = start & ~uintptr_t(page - 1);
+        const uintptr_t aend   = (end + page - 1) & ~uintptr_t(page - 1);
+        const int rc = pin_host_range(reinterpret_cast<void *>(astart), size_t(aend - astart));
+        if (rc != 0) {
+            limit_hit   = true;
+            limit_errno = rc;
+            return false;
+        }
+        locked_bytes += size_t(aend - astart);
+        return true;
+    };
+
+    for (const auto & entry : observed) {
+        if (pinned_bytes >= budget_bytes || limit_hit) {
+            break;
+        }
+        const uint32_t il     = entry.layer;
+        const uint32_t expert = entry.expert;
+        if (il >= model.hparams.n_layer) {
+            continue;
+        }
+
+        // Skip experts already resident in VRAM (handled by the VRAM hot cache).
+        if (model.moe_hot_cache != nullptr && il < model.moe_hot_cache->layers.size()) {
+            const auto & hcl = model.moe_hot_cache->layers[il];
+            if (expert < hcl.hot_id_map_host.size() && hcl.hot_id_map_host[expert] >= 0) {
+                skipped_vram++;
+                continue;
+            }
+        }
+
+        const auto it = size_by_expert.find(key(il, expert));
+        const size_t expert_bytes = it != size_by_expert.end() ? it->second : 0;
+        if (expert_bytes == 0) {
+            continue;
+        }
+        if (pinned_bytes + expert_bytes > budget_bytes) {
+            break; // ranked order: nothing more important fits
+        }
+
+        const auto & layer = model.layers[il];
+        if (layer.ffn_gate_up_exps != nullptr) {
+            pin_tensor_expert(layer.ffn_gate_up_exps, expert);
+        } else {
+            pin_tensor_expert(layer.ffn_gate_exps, expert);
+            pin_tensor_expert(layer.ffn_up_exps,   expert);
+        }
+        pin_tensor_expert(layer.ffn_down_exps, expert);
+        // scale tensors are tiny but pin them too when present and host-resident
+        pin_tensor_expert(layer.ffn_gate_exps_s, expert);
+        pin_tensor_expert(layer.ffn_up_exps_s,   expert);
+        pin_tensor_expert(layer.ffn_down_exps_s, expert);
+
+        if (limit_hit) {
+            break;
+        }
+
+        pinned_bytes += expert_bytes;
+        pinned_experts++;
+    }
+
+    LLAMA_LOG_WARN("%s: RAM-pinned %zu experts, %zu/%zu MiB budget (page-locked %.2f MiB), skipped %zu VRAM-resident\n",
+            __func__, pinned_experts,
+            pinned_bytes / LLAMA_MOE_HOT_CACHE_MIB, budget_bytes / LLAMA_MOE_HOT_CACHE_MIB,
+            locked_bytes / 1024.0 / 1024.0, skipped_vram);
+
+    if (limit_hit) {
+        LLAMA_LOG_WARN("%s: mlock failed (errno=%d: %s) after locking %.2f MiB; the OS memlock limit is likely too low. "
+                "Raise it via 'ulimit -l unlimited' (or /etc/security/limits.conf 'memlock'), or grant CAP_IPC_LOCK. Continuing without further pinning.\n",
+                __func__, limit_errno, std::strerror(limit_errno), locked_bytes / 1024.0 / 1024.0);
+    }
 }
 
 void llama_moe_hot_cache_init_after_model_load(llama_model & model, const llama_model_params & params) {

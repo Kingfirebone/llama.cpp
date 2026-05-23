@@ -175,6 +175,11 @@ void llama_moe_hot_cache_init(llama_model & model, const llama_model_params & pa
 void llama_moe_hot_cache_init_after_model_load(llama_model & model, const llama_model_params & params);
 void llama_moe_hot_cache_init_after_context_memory(const llama_model & model);
 
+// Pin (mlock) the warmest non-VRAM MoE experts into host RAM so the OS does not evict their
+// mmap pages back to disk. Bounded by params.moe_hot_cache_ram_mib; reuses the same perf
+// ranking as the VRAM hot cache and skips experts already resident in VRAM.
+void llama_moe_hot_cache_pin_ram(llama_model & model, const llama_model_params & params);
+
 llama_moe_hot_cache_update_stats llama_moe_hot_cache_update_from_perf_json(
         llama_model & model,
         const std::string & json_str,

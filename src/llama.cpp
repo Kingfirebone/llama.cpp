@@ -330,6 +330,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         llama_moe_hot_cache_init_after_model_load(*model, params);
+        // NOTE: RAM-tier pinning (llama_moe_hot_cache_pin_ram) is intentionally deferred to
+        // after the VRAM hot cache is finalized at context creation, so that the auto-budget
+        // case (--moe-hot-cache-max-mib -1, built in init_after_context_memory) can skip
+        // experts that end up resident in VRAM. See llama-context.cpp.
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

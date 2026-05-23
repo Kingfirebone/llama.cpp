@@ -1515,6 +1515,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.moe_hot_cache_max_mib = params.moe_hot_cache_max_mib;
+    mparams.moe_hot_cache_ram_mib = params.moe_hot_cache_ram_mib;
     mparams.moe_hot_cache_path    = params.moe_hot_cache.empty() ? nullptr : params.moe_hot_cache.c_str();
     mparams.moe_hot_cache_auto_n_ctx = params.n_ctx > 0 ? uint32_t(params.n_ctx) : 0;
     mparams.moe_hot_cache_auto_n_seq_max = params.n_parallel > 0 ? uint32_t(params.n_parallel) : 1;

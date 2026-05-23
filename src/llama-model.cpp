@@ -2128,6 +2128,7 @@ llama_model_params llama_model_default_params() {
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.moe_hot_cache_max_mib       =*/ 0,
+        /*.moe_hot_cache_ram_mib       =*/ 0,
         /*.moe_hot_cache_path          =*/ nullptr,
         /*.moe_hot_cache_auto_n_ctx    =*/ 0,
         /*.moe_hot_cache_auto_n_seq_max=*/ 1,
